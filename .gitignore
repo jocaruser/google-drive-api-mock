@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+coverage/
+*.tsbuildinfo
+*.log
+node-compile-cache/
+.pnpm-store/
