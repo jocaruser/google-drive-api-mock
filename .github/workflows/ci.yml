@@ -19,10 +19,13 @@ jobs:
       - name: Install pnpm
         run: npm install -g pnpm@9.15.0
 
-      # `prepare` builds dist/ as part of install, mirroring what happens
-      # when a consumer installs this repo as a git dependency.
+      # `prepare` rebuilds dist/ on install; dist/ is committed so git
+      # installs work even when the consumer blocks lifecycle scripts.
       - name: Install (runs prepare/build)
         run: pnpm install
+
+      - name: Committed dist/ matches sources
+        run: git diff --exit-code dist
 
       - name: Typecheck
         run: pnpm typecheck
