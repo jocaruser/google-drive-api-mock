@@ -140,7 +140,8 @@ duplicate sibling names get a `~<id>` disk suffix until renormalised.
 ## Development
 
 ```sh
-pnpm install     # dev tooling + builds dist/ (prepare)
+pnpm install     # dev tooling only — dist/ is committed, not rebuilt on install
+pnpm run build   # rebuild dist/ after changing src/ (CI checks it's fresh)
 pnpm lint && pnpm typecheck && pnpm coverage   # 100% thresholds
 pnpm start       # server straight from sources — no build step
 ```

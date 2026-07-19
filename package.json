@@ -1,6 +1,6 @@
 {
   "name": "google-drive-api-mock",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Disk-backed Google Drive v3 + Sheets v4 emulator: state is plain files (one CSV per sheet tab), seed by writing them, assert by reading them. Fails loudly outside the modelled surface.",
   "type": "module",
   "license": "0BSD",
@@ -31,8 +31,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "coverage": "vitest run --coverage",
-    "build": "tsc -p tsconfig.build.json",
-    "prepare": "pnpm run build"
+    "build": "tsc -p tsconfig.build.json"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",

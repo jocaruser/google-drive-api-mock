@@ -30,6 +30,11 @@ This repository is spec-driven. Before any work:
 
 ## Commands
 
-- `pnpm install` — installs dev tooling and builds `dist/` (prepare).
+- `pnpm install` — installs dev tooling only. `dist/` is committed,
+  not rebuilt on install (no `prepare` hook — see ADR-0003: a
+  `prepare` script on a git-installed package forces an isolated
+  nested build for every consumer and caused a real incident).
+- After changing `src/`, run `pnpm run build` before committing;
+  CI fails if committed `dist/` drifts from sources.
 - `pnpm typecheck` / `pnpm test` / `pnpm build` — the CI gate.
 - `pnpm start` — run the server from sources (no build).

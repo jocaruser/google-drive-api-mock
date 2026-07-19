@@ -20,10 +20,19 @@ jobs:
       - name: Install pnpm
         run: npm install -g pnpm@9.15.0
 
-      # `prepare` rebuilds dist/ on install; dist/ is committed so git
-      # installs work even when the consumer blocks lifecycle scripts.
-      - name: Install (runs prepare/build)
+      - name: Install
         run: pnpm install
+
+      # dist/ is committed so git-dependency installs are a pure file copy
+      # (no lifecycle script runs for a consumer). This repo's own `build`
+      # is run explicitly here — never wired to `prepare` — because a
+      # `prepare` script forces pnpm to build the package in isolation for
+      # every consumer that pulls it as a git dependency, which means
+      # installing this repo's own devDependencies from scratch inside that
+      # isolated fetch, every time, and can spiral under network flakiness.
+      # See CHANGELOG v0.2.1.
+      - name: Build
+        run: pnpm run build
 
       - name: Committed dist/ matches sources
         run: git diff --exit-code dist
