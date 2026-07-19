@@ -29,6 +29,12 @@ Scenarios:
 - A `fields` mask such as `files(id,thumbnailLink)` is given
   → each entry carries exactly the requested fields,
   omitting those with no value.
+- No `fields` mask is given
+  → Google's default projection:
+  the envelope carries `kind: "drive#fileList"`
+  and `incompleteSearch: false`,
+  each file `kind: "drive#file"`, `id`, `name` and `mimeType`
+  (single-file reads and creates default the same way).
 
 ## Reading
 

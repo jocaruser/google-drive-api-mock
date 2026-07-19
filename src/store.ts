@@ -42,6 +42,14 @@ export interface FileMeta {
   trashed: boolean
 }
 
+/** Zero-based inclusive bounds; null runs to the data edge. */
+export interface ClearRect {
+  row0: number
+  col0: number
+  row1: number | null
+  col1: number | null
+}
+
 export interface TabMeta {
   sheetId: number
   title: string
@@ -86,6 +94,8 @@ export class DriveStore {
   private counter = 0
   private readonly files = new Map<string, FileMeta>()
   private readonly tabs = new Map<string, TabMeta[]>()
+  /** Exact index text backing the in-memory maps (null: no index yet). */
+  private indexText: string | null = null
 
   constructor(options: DriveStoreOptions) {
     this.rootDir = path.resolve(options.rootDir)
@@ -96,10 +106,41 @@ export class DriveStore {
 
   // ---- index persistence -------------------------------------------------
 
+  /** Raw index text, or null when absent; other read errors stay loud. */
+  private readIndexText(): string | null {
+    try {
+      return fs.readFileSync(path.join(this.rootDir, INDEX_FILE), 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw error
+    }
+  }
+
   private loadIndex(): void {
-    const indexPath = path.join(this.rootDir, INDEX_FILE)
-    if (!fs.existsSync(indexPath)) return
-    const parsed = JSON.parse(fs.readFileSync(indexPath, 'utf8')) as IndexShape
+    this.applyIndexText(this.readIndexText())
+  }
+
+  /**
+   * Parse-then-commit: a corrupt index must fail loudly on every request
+   * (nothing cached, nothing cleared) rather than serve an empty world.
+   */
+  private applyIndexText(text: string | null): void {
+    let parsed: IndexShape | null = null
+    if (text !== null) {
+      try {
+        parsed = JSON.parse(text) as IndexShape
+      } catch {
+        throw new StoreError(
+          400,
+          `google-drive-api-mock: ${INDEX_FILE} is not valid JSON — fix or delete it`
+        )
+      }
+    }
+    this.files.clear()
+    this.tabs.clear()
+    this.counter = 0
+    this.indexText = text
+    if (parsed === null) return
     this.counter = parsed.counter
     for (const [id, meta] of Object.entries(parsed.files)) {
       this.files.set(id, { id, ...meta })
@@ -109,6 +150,21 @@ export class DriveStore {
     }
   }
 
+  /**
+   * Re-read the index when something else changed it on disk — tests seed
+   * and reset a running server purely by writing files (workers are expected
+   * to be sequential; concurrent writers are out of scope). Freshness is
+   * judged by content, not timestamps: the index is small, and comparing text
+   * has no mtime-granularity blind spots. A vanished index means the world
+   * was reset. Every public mutator syncs first, so a long-lived seeding
+   * store never clobbers state another instance (or the server) wrote.
+   */
+  sync(): void {
+    const current = this.readIndexText()
+    if (current === this.indexText) return
+    this.applyIndexText(current)
+  }
+
   private saveIndex(): void {
     const shape: IndexShape = { counter: this.counter, files: {}, tabs: {} }
     for (const [id, meta] of this.files) {
@@ -116,10 +172,9 @@ export class DriveStore {
       shape.files[id] = rest
     }
     for (const [id, tabList] of this.tabs) shape.tabs[id] = tabList
-    fs.writeFileSync(
-      path.join(this.rootDir, INDEX_FILE),
-      JSON.stringify(shape, null, 2) + '\n'
-    )
+    const text = JSON.stringify(shape, null, 2) + '\n'
+    fs.writeFileSync(path.join(this.rootDir, INDEX_FILE), text)
+    this.indexText = text
   }
 
   // ---- path mapping ------------------------------------------------------
@@ -215,10 +270,12 @@ export class DriveStore {
   }
 
   list(): FileMeta[] {
+    this.sync()
     return [...this.files.values()]
   }
 
   createFile(input: CreateFileInput): FileMeta {
+    this.sync()
     this.validateName(input.name)
     const parents = input.parents ?? []
     for (const parentId of parents) this.require(parentId)
@@ -258,6 +315,7 @@ export class DriveStore {
   }
 
   rename(id: string, newName: string): FileMeta {
+    this.sync()
     const meta = this.require(id)
     this.validateName(newName)
     if (newName === meta.name) return meta
@@ -271,6 +329,7 @@ export class DriveStore {
   }
 
   reparent(id: string, addParents: string[], removeParents: string[]): FileMeta {
+    this.sync()
     const meta = this.require(id)
     for (const parentId of addParents) this.require(parentId)
     const oldPath = this.pathOf(id)
@@ -288,12 +347,19 @@ export class DriveStore {
 
   /** Drive can copy files and spreadsheets but not folders — same here. */
   copy(id: string, newName: string, parents?: string[]): FileMeta {
+    this.sync()
     const source = this.require(id)
     if (source.mimeType === FOLDER_MIME)
       throw new StoreError(400, 'Folders cannot be copied.')
     this.validateName(newName)
     const targetParents = parents ?? [...source.parents]
     for (const parentId of targetParents) this.require(parentId)
+    // Resolved before any mutation so a failure cannot leave a phantom
+    // entry; a hand-seeded index may legitimately omit the tabs key.
+    const sourceTabs =
+      source.mimeType === SPREADSHEET_MIME
+        ? (this.tabs.get(id) ?? []).map((tab) => ({ ...tab }))
+        : null
 
     const copied: FileMeta = {
       id: this.nextId({ name: newName, mimeType: source.mimeType }),
@@ -307,11 +373,8 @@ export class DriveStore {
     this.files.set(copied.id, copied)
     const targetPath = this.pathOf(copied.id)
     fs.mkdirSync(path.dirname(targetPath), { recursive: true })
-    if (source.mimeType === SPREADSHEET_MIME) {
-      this.tabs.set(
-        copied.id,
-        (this.tabs.get(id) ?? []).map((tab) => ({ ...tab }))
-      )
+    if (sourceTabs !== null) {
+      this.tabs.set(copied.id, sourceTabs)
       fs.cpSync(this.pathOf(id), targetPath, { recursive: true })
     } else {
       fs.copyFileSync(this.pathOf(id), targetPath)
@@ -321,6 +384,7 @@ export class DriveStore {
   }
 
   delete(id: string): void {
+    this.sync()
     const target = this.pathOf(id)
     for (const descendant of this.descendantsOf(id)) {
       this.files.delete(descendant)
@@ -356,6 +420,7 @@ export class DriveStore {
   }
 
   writeContent(id: string, content: string): void {
+    this.sync()
     const meta = this.require(id)
     if (meta.mimeType === FOLDER_MIME || meta.mimeType === SPREADSHEET_MIME)
       throw new StoreError(400, `${meta.mimeType} cannot carry content`)
@@ -373,10 +438,12 @@ export class DriveStore {
   }
 
   listTabs(id: string): TabMeta[] {
+    this.sync()
     return this.requireSpreadsheet(id).map((tab) => ({ ...tab }))
   }
 
   addTab(id: string, title: string): TabMeta {
+    this.sync()
     const tabList = this.requireSpreadsheet(id)
     this.validateName(title)
     if (tabList.some((tab) => tab.title === title)) {
@@ -408,6 +475,7 @@ export class DriveStore {
   }
 
   getValues(id: string, title: string): string[][] {
+    this.sync()
     this.requireTab(id, title)
     const tabPath = this.tabPath(id, title)
     if (!fs.existsSync(tabPath)) return []
@@ -422,6 +490,7 @@ export class DriveStore {
     col0: number,
     values: string[][]
   ): number {
+    this.sync()
     this.requireTab(id, title)
     const matrix = this.getValues(id, title)
     let written = 0
@@ -440,8 +509,27 @@ export class DriveStore {
     return written
   }
 
-  clearValues(id: string, title: string): void {
+  /**
+   * Blank every cell in the rect (Google `values.clear` semantics: exactly
+   * the requested range, open-ended bounds run to the data edge). No rect
+   * clears the whole tab.
+   */
+  clearValues(id: string, title: string, rect?: ClearRect): void {
+    this.sync()
     this.requireTab(id, title)
-    fs.writeFileSync(this.tabPath(id, title), '')
+    if (rect === undefined) {
+      fs.writeFileSync(this.tabPath(id, title), '')
+      return
+    }
+    const matrix = this.getValues(id, title)
+    const rowEnd = rect.row1 === null ? matrix.length - 1 : rect.row1
+    for (let r = rect.row0; r <= rowEnd && r < matrix.length; r++) {
+      const row = matrix[r]
+      const colEnd = rect.col1 === null ? row.length - 1 : rect.col1
+      for (let c = rect.col0; c <= colEnd && c < row.length; c++) row[c] = ''
+    }
+    while (matrix.length > 0 && matrix[matrix.length - 1].every((cell) => cell === ''))
+      matrix.pop()
+    fs.writeFileSync(this.tabPath(id, title), serializeCsv(matrix))
   }
 }

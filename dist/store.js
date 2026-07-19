@@ -44,6 +44,8 @@ export class DriveStore {
     counter = 0;
     files = new Map();
     tabs = new Map();
+    /** Exact index text backing the in-memory maps (null: no index yet). */
+    indexText = null;
     constructor(options) {
         this.rootDir = path.resolve(options.rootDir);
         this.assignId = options.assignId;
@@ -51,11 +53,40 @@ export class DriveStore {
         this.loadIndex();
     }
     // ---- index persistence -------------------------------------------------
+    /** Raw index text, or null when absent; other read errors stay loud. */
+    readIndexText() {
+        try {
+            return fs.readFileSync(path.join(this.rootDir, INDEX_FILE), 'utf8');
+        }
+        catch (error) {
+            if (error.code === 'ENOENT')
+                return null;
+            throw error;
+        }
+    }
     loadIndex() {
-        const indexPath = path.join(this.rootDir, INDEX_FILE);
-        if (!fs.existsSync(indexPath))
+        this.applyIndexText(this.readIndexText());
+    }
+    /**
+     * Parse-then-commit: a corrupt index must fail loudly on every request
+     * (nothing cached, nothing cleared) rather than serve an empty world.
+     */
+    applyIndexText(text) {
+        let parsed = null;
+        if (text !== null) {
+            try {
+                parsed = JSON.parse(text);
+            }
+            catch {
+                throw new StoreError(400, `google-drive-api-mock: ${INDEX_FILE} is not valid JSON — fix or delete it`);
+            }
+        }
+        this.files.clear();
+        this.tabs.clear();
+        this.counter = 0;
+        this.indexText = text;
+        if (parsed === null)
             return;
-        const parsed = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
         this.counter = parsed.counter;
         for (const [id, meta] of Object.entries(parsed.files)) {
             this.files.set(id, { id, ...meta });
@@ -63,6 +94,21 @@ export class DriveStore {
         for (const [id, tabList] of Object.entries(parsed.tabs)) {
             this.tabs.set(id, tabList);
         }
+    }
+    /**
+     * Re-read the index when something else changed it on disk — tests seed
+     * and reset a running server purely by writing files (workers are expected
+     * to be sequential; concurrent writers are out of scope). Freshness is
+     * judged by content, not timestamps: the index is small, and comparing text
+     * has no mtime-granularity blind spots. A vanished index means the world
+     * was reset. Every public mutator syncs first, so a long-lived seeding
+     * store never clobbers state another instance (or the server) wrote.
+     */
+    sync() {
+        const current = this.readIndexText();
+        if (current === this.indexText)
+            return;
+        this.applyIndexText(current);
     }
     saveIndex() {
         const shape = { counter: this.counter, files: {}, tabs: {} };
@@ -72,7 +118,9 @@ export class DriveStore {
         }
         for (const [id, tabList] of this.tabs)
             shape.tabs[id] = tabList;
-        fs.writeFileSync(path.join(this.rootDir, INDEX_FILE), JSON.stringify(shape, null, 2) + '\n');
+        const text = JSON.stringify(shape, null, 2) + '\n';
+        fs.writeFileSync(path.join(this.rootDir, INDEX_FILE), text);
+        this.indexText = text;
     }
     // ---- path mapping ------------------------------------------------------
     /** Absolute path of a file's node in the mirrored tree. */
@@ -156,9 +204,11 @@ export class DriveStore {
         return meta;
     }
     list() {
+        this.sync();
         return [...this.files.values()];
     }
     createFile(input) {
+        this.sync();
         this.validateName(input.name);
         const parents = input.parents ?? [];
         for (const parentId of parents)
@@ -199,6 +249,7 @@ export class DriveStore {
         return `fake-${this.counter}`;
     }
     rename(id, newName) {
+        this.sync();
         const meta = this.require(id);
         this.validateName(newName);
         if (newName === meta.name)
@@ -212,6 +263,7 @@ export class DriveStore {
         return meta;
     }
     reparent(id, addParents, removeParents) {
+        this.sync();
         const meta = this.require(id);
         for (const parentId of addParents)
             this.require(parentId);
@@ -230,6 +282,7 @@ export class DriveStore {
     }
     /** Drive can copy files and spreadsheets but not folders — same here. */
     copy(id, newName, parents) {
+        this.sync();
         const source = this.require(id);
         if (source.mimeType === FOLDER_MIME)
             throw new StoreError(400, 'Folders cannot be copied.');
@@ -237,6 +290,11 @@ export class DriveStore {
         const targetParents = parents ?? [...source.parents];
         for (const parentId of targetParents)
             this.require(parentId);
+        // Resolved before any mutation so a failure cannot leave a phantom
+        // entry; a hand-seeded index may legitimately omit the tabs key.
+        const sourceTabs = source.mimeType === SPREADSHEET_MIME
+            ? (this.tabs.get(id) ?? []).map((tab) => ({ ...tab }))
+            : null;
         const copied = {
             id: this.nextId({ name: newName, mimeType: source.mimeType }),
             name: newName,
@@ -249,8 +307,8 @@ export class DriveStore {
         this.files.set(copied.id, copied);
         const targetPath = this.pathOf(copied.id);
         fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-        if (source.mimeType === SPREADSHEET_MIME) {
-            this.tabs.set(copied.id, (this.tabs.get(id) ?? []).map((tab) => ({ ...tab })));
+        if (sourceTabs !== null) {
+            this.tabs.set(copied.id, sourceTabs);
             fs.cpSync(this.pathOf(id), targetPath, { recursive: true });
         }
         else {
@@ -260,6 +318,7 @@ export class DriveStore {
         return copied;
     }
     delete(id) {
+        this.sync();
         const target = this.pathOf(id);
         for (const descendant of this.descendantsOf(id)) {
             this.files.delete(descendant);
@@ -289,6 +348,7 @@ export class DriveStore {
         return fs.readFileSync(this.pathOf(id), 'utf8');
     }
     writeContent(id, content) {
+        this.sync();
         const meta = this.require(id);
         if (meta.mimeType === FOLDER_MIME || meta.mimeType === SPREADSHEET_MIME)
             throw new StoreError(400, `${meta.mimeType} cannot carry content`);
@@ -303,9 +363,11 @@ export class DriveStore {
         return tabList;
     }
     listTabs(id) {
+        this.sync();
         return this.requireSpreadsheet(id).map((tab) => ({ ...tab }));
     }
     addTab(id, title) {
+        this.sync();
         const tabList = this.requireSpreadsheet(id);
         this.validateName(title);
         if (tabList.some((tab) => tab.title === title)) {
@@ -330,6 +392,7 @@ export class DriveStore {
         return tab;
     }
     getValues(id, title) {
+        this.sync();
         this.requireTab(id, title);
         const tabPath = this.tabPath(id, title);
         if (!fs.existsSync(tabPath))
@@ -338,6 +401,7 @@ export class DriveStore {
     }
     /** Rectangle overwrite at (row0, col0), Sheets `values.update` semantics. */
     setValuesRect(id, title, row0, col0, values) {
+        this.sync();
         this.requireTab(id, title);
         const matrix = this.getValues(id, title);
         let written = 0;
@@ -357,8 +421,28 @@ export class DriveStore {
         fs.writeFileSync(this.tabPath(id, title), serializeCsv(matrix));
         return written;
     }
-    clearValues(id, title) {
+    /**
+     * Blank every cell in the rect (Google `values.clear` semantics: exactly
+     * the requested range, open-ended bounds run to the data edge). No rect
+     * clears the whole tab.
+     */
+    clearValues(id, title, rect) {
+        this.sync();
         this.requireTab(id, title);
-        fs.writeFileSync(this.tabPath(id, title), '');
+        if (rect === undefined) {
+            fs.writeFileSync(this.tabPath(id, title), '');
+            return;
+        }
+        const matrix = this.getValues(id, title);
+        const rowEnd = rect.row1 === null ? matrix.length - 1 : rect.row1;
+        for (let r = rect.row0; r <= rowEnd && r < matrix.length; r++) {
+            const row = matrix[r];
+            const colEnd = rect.col1 === null ? row.length - 1 : rect.col1;
+            for (let c = rect.col0; c <= colEnd && c < row.length; c++)
+                row[c] = '';
+        }
+        while (matrix.length > 0 && matrix[matrix.length - 1].every((cell) => cell === ''))
+            matrix.pop();
+        fs.writeFileSync(this.tabPath(id, title), serializeCsv(matrix));
     }
 }

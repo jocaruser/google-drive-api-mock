@@ -12,17 +12,45 @@ import { DriveStore, StoreError, type DriveStoreOptions } from './store.ts'
  * real Drive serves via signed lh3 URLs the emulator does not model.
  */
 
-const STATUS_NAMES: Record<number, string> = {
-  400: 'INVALID_ARGUMENT',
-  401: 'UNAUTHENTICATED',
-  404: 'NOT_FOUND',
-  409: 'ALREADY_EXISTS',
-  500: 'INTERNAL',
+type Api = 'drive' | 'sheets'
+
+/** Every error the emulator raises uses one of these codes. */
+type ErrorCode = 400 | 401 | 404 | 409
+
+/**
+ * One row per raisable code: `status` is the modern RPC status both APIs
+ * carry; `reason` feeds Drive's legacy `errors[]` entries. Extending the
+ * emulator with a new code is a single row here — the keyed Record makes a
+ * missing column a compile error.
+ */
+const ERROR_CATALOGUE: Record<ErrorCode, { status: string; reason: string }> = {
+  400: { status: 'INVALID_ARGUMENT', reason: 'badRequest' },
+  401: { status: 'UNAUTHENTICATED', reason: 'authError' },
+  404: { status: 'NOT_FOUND', reason: 'notFound' },
+  409: { status: 'ALREADY_EXISTS', reason: 'duplicate' },
 }
 
-function errorResponse(code: number, message: string): Response {
+function errorResponse(code: ErrorCode, message: string, api: Api): Response {
+  const { status, reason } = ERROR_CATALOGUE[code]
+  if (api === 'sheets') {
+    return jsonResponse(code, { error: { code, message, status } })
+  }
   return jsonResponse(code, {
-    error: { code, message, status: STATUS_NAMES[code] ?? 'UNKNOWN' },
+    error: {
+      code,
+      message,
+      errors: [
+        {
+          message,
+          domain: 'global',
+          reason,
+          ...(code === 401
+            ? { location: 'Authorization', locationType: 'header' }
+            : {}),
+        },
+      ],
+      status,
+    },
   })
 }
 
@@ -34,10 +62,10 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 function toResponse(result: ApiResult): Response {
-  if (result.text !== undefined) {
+  if ('text' in result) {
     return new Response(result.text, {
       status: result.status,
-      headers: { 'Content-Type': result.contentType ?? 'text/plain' },
+      headers: { 'Content-Type': result.contentType },
     })
   }
   if (result.json !== undefined) return jsonResponse(result.status, result.json)
@@ -55,6 +83,7 @@ export function createFakeGoogle(options: DriveStoreOptions): FakeGoogle {
   async function handle(request: Request): Promise<Response> {
     const url = new URL(request.url)
     const method = request.method.toUpperCase()
+    const api: Api = url.pathname.startsWith('/v4') ? 'sheets' : 'drive'
 
     const mediaDownload =
       method === 'GET' && url.searchParams.get('alt') === 'media'
@@ -62,7 +91,8 @@ export function createFakeGoogle(options: DriveStoreOptions): FakeGoogle {
     if (!mediaDownload && !authorization.startsWith('Bearer ')) {
       return errorResponse(
         401,
-        'Request had invalid authentication credentials. Expected OAuth 2 access token.'
+        'Request had invalid authentication credentials. Expected OAuth 2 access token.',
+        api
       )
     }
 
@@ -70,6 +100,11 @@ export function createFakeGoogle(options: DriveStoreOptions): FakeGoogle {
       method === 'GET' || method === 'HEAD' ? '' : await request.text()
 
     try {
+      // State may have been seeded or reset on disk while serving (the whole
+      // point of file-based seeding) — pick up external index changes first.
+      // Inside the try so a corrupt index answers as a loud Google-shaped 400.
+      store.sync()
+
       if (url.pathname.startsWith('/upload/drive/v3')) {
         return toResponse(
           handleUpload(
@@ -89,11 +124,12 @@ export function createFakeGoogle(options: DriveStoreOptions): FakeGoogle {
       }
       return errorResponse(
         404,
-        `google-drive-api-mock: unhandled path ${url.pathname} (expected /drive/v3, /upload/drive/v3 or /v4)`
+        `google-drive-api-mock: unhandled path ${url.pathname} (expected /drive/v3, /upload/drive/v3 or /v4)`,
+        api
       )
     } catch (error) {
       if (error instanceof StoreError)
-        return errorResponse(error.code, error.message)
+        return errorResponse(error.code, error.message, api)
       throw error
     }
   }

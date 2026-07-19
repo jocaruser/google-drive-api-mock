@@ -5,12 +5,14 @@ import { DriveStore } from './store.ts';
  * paths the real API would accept but this emulator does not model — fails
  * loudly with a 400/404 so tests never pass on silent approximations.
  */
-export interface ApiResult {
+export type ApiResult = {
     status: number;
     json?: unknown;
-    text?: string;
-    contentType?: string;
-}
+} | {
+    status: number;
+    text: string;
+    contentType: string;
+};
 interface Predicates {
     name?: string;
     parent?: string;

@@ -8,9 +8,8 @@ import { parseQuery } from '../src/drive.ts'
 import { applyFieldMask, parseFieldMask } from '../src/fields.ts'
 import { StoreError } from '../src/store.ts'
 
-const DRIVE = 'https://www.googleapis.com/drive/v3'
-const UPLOAD = 'https://www.googleapis.com/upload/drive/v3'
-const SHEETS = 'https://sheets.googleapis.com/v4'
+import { DRIVE, SHEETS, UPLOAD, bindCall, multipartBody } from './helpers.ts'
+
 const FOLDER_MIME = 'application/vnd.google-apps.folder'
 
 let rootDir: string
@@ -25,23 +24,7 @@ afterEach(() => {
   fs.rmSync(rootDir, { recursive: true, force: true })
 })
 
-async function call(
-  method: string,
-  url: string,
-  body?: unknown,
-  headers: Record<string, string> = {}
-): Promise<{ status: number; text: string; json: () => unknown }> {
-  const init: RequestInit = {
-    method,
-    headers: { Authorization: 'Bearer test-token', ...headers },
-  }
-  if (body !== undefined) {
-    init.body = typeof body === 'string' ? body : JSON.stringify(body)
-  }
-  const response = await fake.handle(new Request(url, init))
-  const text = await response.text()
-  return { status: response.status, text, json: () => JSON.parse(text) }
-}
+const call = bindCall(() => fake)
 
 function range(spreadsheetId: string, ref: string, suffix = ''): string {
   return `${SHEETS}/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(ref)}${suffix}`
@@ -63,26 +46,20 @@ async function createShopFixture(): Promise<{
   })
   const spreadsheetId = (spreadsheet.json() as { spreadsheetId: string }).spreadsheetId
   await call('PATCH', `${DRIVE}/files/${spreadsheetId}?addParents=${folderId}&removeParents=`, {})
-  const boundary = 'illo3d-multipart'
+  const metadataUpload = multipartBody(
+    {
+      name: 'illo3d.metadata.json',
+      parents: [folderId],
+      mimeType: 'application/json',
+    },
+    JSON.stringify({ app: 'illo3d', version: '3.0.0', spreadsheetId }),
+    { boundary: 'illo3d-multipart' }
+  )
   const upload = await call(
     'POST',
     `${UPLOAD}/files?uploadType=multipart`,
-    [
-      `--${boundary}`,
-      'Content-Type: application/json; charset=UTF-8',
-      '',
-      JSON.stringify({
-        name: 'illo3d.metadata.json',
-        parents: [folderId],
-        mimeType: 'application/json',
-      }),
-      `--${boundary}`,
-      'Content-Type: application/json',
-      '',
-      JSON.stringify({ app: 'illo3d', version: '3.0.0', spreadsheetId }),
-      `--${boundary}--`,
-    ].join('\r\n'),
-    { 'Content-Type': `multipart/related; boundary=${boundary}` }
+    metadataUpload.body,
+    { 'Content-Type': metadataUpload.header }
   )
   const metadataFileId = (upload.json() as { id: string }).id
   return { folderId, spreadsheetId, metadataFileId }
@@ -122,11 +99,22 @@ describe('drive files', () => {
     expect(after.json()).toEqual({ files: [] })
   })
 
-  it('404s with Google-shaped errors on unknown files', async () => {
+  it('404s with the Drive error envelope (legacy errors[] included)', async () => {
     const missing = await call('GET', `${DRIVE}/files/nope?fields=name`)
     expect(missing.status).toBe(404)
     expect(missing.json()).toEqual({
-      error: { code: 404, message: 'File not found: nope.', status: 'NOT_FOUND' },
+      error: {
+        code: 404,
+        message: 'File not found: nope.',
+        errors: [
+          {
+            message: 'File not found: nope.',
+            domain: 'global',
+            reason: 'notFound',
+          },
+        ],
+        status: 'NOT_FOUND',
+      },
     })
   })
 
@@ -141,23 +129,14 @@ describe('drive files', () => {
 
   it('serves image thumbnails through an auth-exempt self link', async () => {
     const { folderId } = await createShopFixture()
-    const boundary = 'b'
-    await call(
-      'POST',
-      `${UPLOAD}/files?uploadType=multipart`,
-      [
-        `--${boundary}`,
-        'Content-Type: application/json',
-        '',
-        JSON.stringify({ name: 'logo.svg', parents: [folderId], mimeType: 'image/svg+xml' }),
-        `--${boundary}`,
-        'Content-Type: image/svg+xml',
-        '',
-        '<svg xmlns="http://www.w3.org/2000/svg"/>',
-        `--${boundary}--`,
-      ].join('\r\n'),
-      { 'Content-Type': `multipart/related; boundary=${boundary}` }
+    const logoUpload = multipartBody(
+      { name: 'logo.svg', parents: [folderId], mimeType: 'image/svg+xml' },
+      '<svg xmlns="http://www.w3.org/2000/svg"/>',
+      { contentType: 'image/svg+xml' }
     )
+    await call('POST', `${UPLOAD}/files?uploadType=multipart`, logoUpload.body, {
+      'Content-Type': logoUpload.header,
+    })
 
     const q = encodeURIComponent(`name='logo.svg' and '${folderId}' in parents and trashed=false`)
     const list = await call(

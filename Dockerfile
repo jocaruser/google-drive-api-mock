@@ -11,4 +11,4 @@ ENV GOOGLE_DRIVE_API_MOCK_DATA_DIR=/data
 EXPOSE 8790
 VOLUME /data
 
-CMD ["node", "src/server.ts"]
+CMD ["node", "src/main.ts"]

@@ -64,6 +64,7 @@ function matches(meta, predicates) {
 /** Full resource as the emulator models it; `fields` masks project from this. */
 function fileResource(meta, origin) {
     return {
+        kind: 'drive#file',
         id: meta.id,
         name: meta.name,
         mimeType: meta.mimeType,
@@ -79,11 +80,10 @@ function fileResource(meta, origin) {
     };
 }
 function project(resource, fields) {
-    if (fields === null)
-        return resource;
     return applyFieldMask(resource, parseFieldMask(fields));
 }
-const DEFAULT_FILE_FIELDS = 'id,name,mimeType';
+// Google's documented default projection for file resources.
+const DEFAULT_FILE_FIELDS = 'kind,id,name,mimeType';
 export function handleDrive(store, method, url, bodyText) {
     const subPath = url.pathname.replace(/^\/drive\/v3/, '');
     const fields = url.searchParams.get('fields');
@@ -95,11 +95,13 @@ export function handleDrive(store, method, url, bodyText) {
         if (pageSize !== null)
             found = found.slice(0, Number(pageSize));
         const envelope = {
+            kind: 'drive#fileList',
+            incompleteSearch: false,
             files: found.map((meta) => fileResource(meta, url.origin)),
         };
         return {
             status: 200,
-            json: project(envelope, fields ?? `files(${DEFAULT_FILE_FIELDS})`),
+            json: project(envelope, fields ?? `kind,incompleteSearch,files(${DEFAULT_FILE_FIELDS})`),
         };
     }
     if (subPath === '/files' && method === 'POST') {

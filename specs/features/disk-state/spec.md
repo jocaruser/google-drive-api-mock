@@ -30,6 +30,23 @@ Scenarios:
 - The emulator is restarted over an existing root
   → the world resumes exactly, driven by `_index.json`.
 
+## External changes while serving
+
+Seeding needs no admin endpoints: files are the API.
+
+Scenarios:
+
+- Another process (a test runner) writes files and index entries
+  into the data directory while the server runs
+  → the next request answers from the new state.
+- `_index.json` disappears
+  → the world is treated as reset (empty, id counter restarted).
+- Nothing changed on disk
+  → requests answer from memory without re-reading the index
+  (the index fingerprint — mtime and size — is compared per request).
+- Writers are expected to be sequential with request handling;
+  concurrent writes race and are out of scope.
+
 ## Identifiers
 
 Scenarios:

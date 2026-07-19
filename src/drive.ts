@@ -8,12 +8,9 @@ import { DriveStore, FOLDER_MIME, StoreError, type FileMeta } from './store.ts'
  * loudly with a 400/404 so tests never pass on silent approximations.
  */
 
-export interface ApiResult {
-  status: number
-  json?: unknown
-  text?: string
-  contentType?: string
-}
+export type ApiResult =
+  | { status: number; json?: unknown }
+  | { status: number; text: string; contentType: string }
 
 interface Predicates {
   name?: string
@@ -84,6 +81,7 @@ function matches(meta: FileMeta, predicates: Predicates): boolean {
 /** Full resource as the emulator models it; `fields` masks project from this. */
 function fileResource(meta: FileMeta, origin: string): Record<string, unknown> {
   return {
+    kind: 'drive#file',
     id: meta.id,
     name: meta.name,
     mimeType: meta.mimeType,
@@ -99,12 +97,12 @@ function fileResource(meta: FileMeta, origin: string): Record<string, unknown> {
   }
 }
 
-function project(resource: unknown, fields: string | null): unknown {
-  if (fields === null) return resource
+function project(resource: unknown, fields: string): unknown {
   return applyFieldMask(resource, parseFieldMask(fields))
 }
 
-const DEFAULT_FILE_FIELDS = 'id,name,mimeType'
+// Google's documented default projection for file resources.
+const DEFAULT_FILE_FIELDS = 'kind,id,name,mimeType'
 
 export function handleDrive(
   store: DriveStore,
@@ -122,11 +120,16 @@ export function handleDrive(
     const pageSize = url.searchParams.get('pageSize')
     if (pageSize !== null) found = found.slice(0, Number(pageSize))
     const envelope = {
+      kind: 'drive#fileList',
+      incompleteSearch: false,
       files: found.map((meta) => fileResource(meta, url.origin)),
     }
     return {
       status: 200,
-      json: project(envelope, fields ?? `files(${DEFAULT_FILE_FIELDS})`),
+      json: project(
+        envelope,
+        fields ?? `kind,incompleteSearch,files(${DEFAULT_FILE_FIELDS})`
+      ),
     }
   }
 

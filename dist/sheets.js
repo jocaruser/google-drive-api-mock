@@ -1,5 +1,22 @@
 import { applyFieldMask, parseFieldMask } from "./fields.js";
 import { SPREADSHEET_MIME, StoreError } from "./store.js";
+/**
+ * Sheets v4 subset: spreadsheets.create, spreadsheets.get, `addSheet` via
+ * batchUpdate, and values get/update(RAW)/clear. Tab data lives as one CSV per
+ * tab in the store; `values.get` trims trailing empty rows/cells and omits
+ * `values` entirely when the range is empty, matching Google.
+ */
+/** Google's spreadsheets.values RPC verbs (the `…/values/{range}:verb` set). */
+const VALUES_VERBS = new Set([
+    'append',
+    'batchClear',
+    'batchClearByDataFilter',
+    'batchGet',
+    'batchGetByDataFilter',
+    'batchUpdate',
+    'batchUpdateByDataFilter',
+    'clear',
+]);
 function parseRange(range) {
     const quoted = /^'((?:[^']|'')*)'(?:!(.+))?$/.exec(range);
     if (quoted !== null) {
@@ -19,10 +36,11 @@ function columnIndex(letters) {
 }
 function parseRef(ref, range) {
     if (ref === null)
-        return { row0: 0, col0: 0, row1: null, col1: null };
+        return { form: 'all', row0: 0, col0: 0, row1: null, col1: null };
     let match;
     if ((match = /^([A-Z]+):([A-Z]+)$/.exec(ref)) !== null) {
         return {
+            form: 'colRange',
             row0: 0,
             col0: columnIndex(match[1]),
             row1: null,
@@ -31,6 +49,7 @@ function parseRef(ref, range) {
     }
     if ((match = /^(\d+):(\d+)$/.exec(ref)) !== null) {
         return {
+            form: 'rowRange',
             row0: Number(match[1]) - 1,
             col0: 0,
             row1: Number(match[2]) - 1,
@@ -39,6 +58,7 @@ function parseRef(ref, range) {
     }
     if ((match = /^([A-Z]+)(\d+):([A-Z]+)(\d+)$/.exec(ref)) !== null) {
         return {
+            form: 'rect',
             row0: Number(match[2]) - 1,
             col0: columnIndex(match[1]),
             row1: Number(match[4]) - 1,
@@ -46,12 +66,9 @@ function parseRef(ref, range) {
         };
     }
     if ((match = /^([A-Z]+)(\d+)$/.exec(ref)) !== null) {
-        return {
-            row0: Number(match[2]) - 1,
-            col0: columnIndex(match[1]),
-            row1: null,
-            col1: null,
-        };
+        const row0 = Number(match[2]) - 1;
+        const col0 = columnIndex(match[1]);
+        return { form: 'cell', row0, col0, row1: row0, col1: col0 };
     }
     throw new StoreError(400, `Unable to parse range: ${range}`);
 }
@@ -77,6 +94,7 @@ function spreadsheetEnvelope(store, id) {
         sheets: store.listTabs(id).map((tab, index) => ({
             properties: { sheetId: tab.sheetId, title: tab.title, index },
         })),
+        spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${id}/edit`,
     };
 }
 function cellValues(body) {
@@ -146,16 +164,19 @@ export function handleSheets(store, method, url, bodyText) {
         const id = decodeURIComponent(match[1]);
         store.requireSpreadsheet(id);
         const rawRange = match[2];
-        if (rawRange.endsWith(':clear')) {
-            if (method !== 'POST')
+        // A trailing `:verb` from Google's RPC verb set is a values method call;
+        // only `clear` is modelled and the rest fail as unmodelled. Anything else
+        // after a colon (`Sheet1!A1:B2` sent unencoded — legal, and accepted by
+        // real Sheets) is part of the range.
+        const verb = /:([A-Za-z][A-Za-z0-9]*)$/.exec(rawRange);
+        if (verb !== null && VALUES_VERBS.has(verb[1])) {
+            if (verb[1] !== 'clear' || method !== 'POST')
                 throw unhandled(method, url);
-            const range = decodeURIComponent(rawRange.slice(0, -':clear'.length));
+            const range = decodeURIComponent(rawRange.slice(0, verb.index));
             const { title, ref } = parseRange(range);
-            const rect = parseRef(ref, range);
-            if (rect.row0 !== 0 || rect.col0 !== 0 || rect.row1 !== null) {
-                throw new StoreError(400, `google-drive-api-mock: only whole-sheet clears are supported (got ${range})`);
-            }
-            store.clearValues(id, title);
+            // Google clears exactly the requested range; open bounds run to the
+            // data edge, a bare title clears the whole tab.
+            store.clearValues(id, title, ref === null ? undefined : parseRef(ref, range));
             return { status: 200, json: { spreadsheetId: id, clearedRange: range } };
         }
         const range = decodeURIComponent(rawRange);
@@ -177,10 +198,19 @@ export function handleSheets(store, method, url, bodyText) {
             if (inputOption !== 'RAW') {
                 throw new StoreError(400, `google-drive-api-mock: valueInputOption=RAW is required (got ${inputOption ?? 'none'})`);
             }
-            if (rect.row1 !== null || rect.col1 !== null || ref === null) {
-                throw new StoreError(400, `google-drive-api-mock: values.update needs a start cell like A1 (got ${range})`);
+            if (rect.form !== 'cell' && rect.form !== 'rect') {
+                throw new StoreError(400, `google-drive-api-mock: values.update needs a cell or rectangle range (got ${range})`);
             }
             const values = cellValues(parseJson(bodyText));
+            // A bare cell anchors and expands (real Sheets semantics); a bounded
+            // rectangle must contain the payload.
+            if (rect.form === 'rect') {
+                const fitsRows = values.length <= rect.row1 - rect.row0 + 1;
+                const fitsCols = values.every((row) => row.length <= rect.col1 - rect.col0 + 1);
+                if (!fitsRows || !fitsCols) {
+                    throw new StoreError(400, `google-drive-api-mock: values exceed the requested range ${range}`);
+                }
+            }
             const updatedCells = store.setValuesRect(id, title, rect.row0, rect.col0, values);
             return {
                 status: 200,
@@ -188,6 +218,7 @@ export function handleSheets(store, method, url, bodyText) {
                     spreadsheetId: id,
                     updatedRange: range,
                     updatedRows: values.length,
+                    updatedColumns: values.reduce((max, row) => Math.max(max, row.length), 0),
                     updatedCells,
                 },
             };

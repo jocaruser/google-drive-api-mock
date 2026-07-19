@@ -2,24 +2,38 @@ import { handleDrive, handleUpload } from "./drive.js";
 import { handleSheets } from "./sheets.js";
 import { DriveStore, StoreError } from "./store.js";
 /**
- * Fetch-level entry point: one web-standard `Request` in, one `Response` out.
- * Transport-agnostic on purpose — Playwright mounts it behind `page.route`,
- * `server.ts` behind a real HTTP listener, and unit tests call it directly.
- *
- * Every request needs a `Bearer` token except `GET …?alt=media`: the app loads
- * image thumbnails through plain `<img src>` (no Authorization header), which
- * real Drive serves via signed lh3 URLs the emulator does not model.
+ * One row per raisable code: `status` is the modern RPC status both APIs
+ * carry; `reason` feeds Drive's legacy `errors[]` entries. Extending the
+ * emulator with a new code is a single row here — the keyed Record makes a
+ * missing column a compile error.
  */
-const STATUS_NAMES = {
-    400: 'INVALID_ARGUMENT',
-    401: 'UNAUTHENTICATED',
-    404: 'NOT_FOUND',
-    409: 'ALREADY_EXISTS',
-    500: 'INTERNAL',
+const ERROR_CATALOGUE = {
+    400: { status: 'INVALID_ARGUMENT', reason: 'badRequest' },
+    401: { status: 'UNAUTHENTICATED', reason: 'authError' },
+    404: { status: 'NOT_FOUND', reason: 'notFound' },
+    409: { status: 'ALREADY_EXISTS', reason: 'duplicate' },
 };
-function errorResponse(code, message) {
+function errorResponse(code, message, api) {
+    const { status, reason } = ERROR_CATALOGUE[code];
+    if (api === 'sheets') {
+        return jsonResponse(code, { error: { code, message, status } });
+    }
     return jsonResponse(code, {
-        error: { code, message, status: STATUS_NAMES[code] ?? 'UNKNOWN' },
+        error: {
+            code,
+            message,
+            errors: [
+                {
+                    message,
+                    domain: 'global',
+                    reason,
+                    ...(code === 401
+                        ? { location: 'Authorization', locationType: 'header' }
+                        : {}),
+                },
+            ],
+            status,
+        },
     });
 }
 function jsonResponse(status, body) {
@@ -29,10 +43,10 @@ function jsonResponse(status, body) {
     });
 }
 function toResponse(result) {
-    if (result.text !== undefined) {
+    if ('text' in result) {
         return new Response(result.text, {
             status: result.status,
-            headers: { 'Content-Type': result.contentType ?? 'text/plain' },
+            headers: { 'Content-Type': result.contentType },
         });
     }
     if (result.json !== undefined)
@@ -44,13 +58,18 @@ export function createFakeGoogle(options) {
     async function handle(request) {
         const url = new URL(request.url);
         const method = request.method.toUpperCase();
+        const api = url.pathname.startsWith('/v4') ? 'sheets' : 'drive';
         const mediaDownload = method === 'GET' && url.searchParams.get('alt') === 'media';
         const authorization = request.headers.get('authorization') ?? '';
         if (!mediaDownload && !authorization.startsWith('Bearer ')) {
-            return errorResponse(401, 'Request had invalid authentication credentials. Expected OAuth 2 access token.');
+            return errorResponse(401, 'Request had invalid authentication credentials. Expected OAuth 2 access token.', api);
         }
         const bodyText = method === 'GET' || method === 'HEAD' ? '' : await request.text();
         try {
+            // State may have been seeded or reset on disk while serving (the whole
+            // point of file-based seeding) — pick up external index changes first.
+            // Inside the try so a corrupt index answers as a loud Google-shaped 400.
+            store.sync();
             if (url.pathname.startsWith('/upload/drive/v3')) {
                 return toResponse(handleUpload(store, method, url, bodyText, request.headers.get('content-type') ?? ''));
             }
@@ -60,11 +79,11 @@ export function createFakeGoogle(options) {
             if (url.pathname.startsWith('/v4')) {
                 return toResponse(handleSheets(store, method, url, bodyText));
             }
-            return errorResponse(404, `google-drive-api-mock: unhandled path ${url.pathname} (expected /drive/v3, /upload/drive/v3 or /v4)`);
+            return errorResponse(404, `google-drive-api-mock: unhandled path ${url.pathname} (expected /drive/v3, /upload/drive/v3 or /v4)`, api);
         }
         catch (error) {
             if (error instanceof StoreError)
-                return errorResponse(error.code, error.message);
+                return errorResponse(error.code, error.message, api);
             throw error;
         }
     }

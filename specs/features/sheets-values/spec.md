@@ -11,9 +11,12 @@ Scenarios:
 
 - `POST /v4/spreadsheets` with a title and initial sheet titles
   → a spreadsheet exists (parented at the root until moved via Drive),
-  one tab per requested title, `sheetId`s assigned deterministically.
+  one tab per requested title, `sheetId`s assigned deterministically;
+  the envelope carries a `spreadsheetUrl`
+  (`https://docs.google.com/spreadsheets/d/{id}/edit`).
 - `GET /v4/spreadsheets/{id}?fields=sheets.properties.title`
-  → the tab titles in order.
+  → the tab titles in order
+  (without `fields`, the full envelope including `spreadsheetUrl`).
 - `POST …:batchUpdate` with an `addSheet` request
   → the tab is added and its properties returned.
 - `addSheet` for a title that already exists
@@ -45,13 +48,20 @@ Scenarios:
 - `valueInputOption=RAW` with a start cell (for example `'tab'!A1`)
   → the payload overwrites exactly the rectangle it covers,
   leaving cells outside it untouched
-  (a header rewrite must not clobber data rows).
+  (a header rewrite must not clobber data rows);
+  the response reports `updatedRows`, `updatedColumns`
+  and `updatedCells`.
 - `valueInputOption` missing or not `RAW` → 400.
 
 ## Clearing (`POST …/values/{range}:clear`)
 
 Scenarios:
 
-- A whole-sheet range (for example `'tab'!A:ZZ`)
-  → every value in the tab is gone; the tab itself remains.
-- A partial range → 400 (only whole-sheet clears are modelled).
+- Any range → exactly the cells it covers are blanked,
+  as in real Sheets: `'tab'!A:ZZ` or a bare title clears the tab,
+  `'tab'!A:B` clears only those columns,
+  `'tab'!A1` clears one cell; the tab itself always remains.
+- A trailing `:verb` other than `clear`
+  (for example `:append`) → 404 as an unmodelled method;
+  a colon inside an unencoded range (`tab!A1:B2`)
+  is part of the range, never a verb.

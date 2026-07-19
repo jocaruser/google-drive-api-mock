@@ -21,11 +21,19 @@ Scenarios:
 
 ## Error envelope
 
-Every error is Google-shaped:
+Errors are Google-shaped per API.
+Sheets errors carry the modern RPC trio:
 
 ```json
 { "error": { "code": 404, "message": "…", "status": "NOT_FOUND" } }
 ```
+
+Drive errors additionally carry the legacy `errors[]` array —
+`message`, `domain: "global"` and a `reason`
+(`badRequest`, `authError`, `notFound`, `duplicate`) —
+and 401 entries name the failing header
+(`location: "Authorization"`, `locationType: "header"`),
+exactly as real Drive does.
 
 Messages reuse Google's wording where consumers are known
 to branch on it
@@ -38,7 +46,8 @@ Scenarios:
 
 - A request outside the modelled surface —
   an unknown path, an unsupported `q` clause,
-  a `batchUpdate` request type, a partial-range clear,
+  a `batchUpdate` request type,
+  an unmodelled values verb (`…/values/{range}:append` and friends),
   a non-`RAW` value input —
   → 400 or 404 whose message begins with `google-drive-api-mock:`
   or names the offending clause,
@@ -48,3 +57,7 @@ Scenarios:
   with an explicit message,
   which is the signal to extend the modelled surface
   (and this spec) in the same change.
+- `_index.json` holds invalid JSON (a broken seed)
+  → every request fails 400 naming the file,
+  and nothing is served from a half-loaded world;
+  fixing or deleting the file recovers on the next request.
